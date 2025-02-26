@@ -1,0 +1,23 @@
+#!/bin/bash
+
+#确保机器安装了perf和perf脚本工具
+#1.sudo apt install linux-tools-common linux-tools-generic linux-tools-$(uname -r)
+#2.git clone https://github.com/brendangregg/FlameGraph
+#3.升级binutils: 网上下载安装包 #建议./configure 不指定路径, 默认安装在/usr/local目录下
+
+exe_file=xxx
+
+perf_tools_path=xxx/FlameGraph
+innohip_so_path=xxx
+
+
+now_path=`pwd`
+
+cd $innohip_so_path
+sudo perf record -g --call-graph dwarf -F 99 $exe_file
+sudo perf script > $now_path/out.perf
+
+cd $perf_tools_path
+./stackcollapse-perf.pl $now_path/out.perf | ./flamegraph.pl > $now_path/perf_flamegraph.svg
+
+exit 0
