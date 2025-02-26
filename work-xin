@@ -1,0 +1,304 @@
+uboot添加自己的板载：
+1、u-boot-2020.04\board\innosilicon\g1p 配置：.c,Kconfig,Makefile三个文件
+2、u-boot-2020.04\include\configs 添加一个头文件，存放自定义的宏，比如栈顶，malloc大小
+3、u-boot-2020.04\arch\riscv  对应cpu的Kconfig中添加上面的信息
+config TARGET_INNO_G1P
+	bool "Support Innosilicon G1P Board"
+source "board/innosilicon/g1p/Kconfig"
+4、make menuconfig 就可以选择我们自己平台
+
+保存.config: make savedefconfig && cp defconfig configs/xxx_defconfig
+生成.config: make xxx_defconfig  #会自动在configs/下找
+
+g1:
+IRom:32k, 0~7FFF
+SRam:256k, C_0000~F_FFFF
+#空间分配：
+sram end   <= 0xFFFFF
+sp      <=  0x100000 ↓  #栈指针
+
+.bss
+.data
+.text   <=  0xe0000 ↑
+malloc  <=  0xe0000 ↓
+gd      <=  0xe0000-sizeof(malloc)  ↓
+bd      <=  0xe0000-sizeof(malloc)-sizeof(gd) ↓
+
+sram start <= 0xc0000
+
+g0:
+IRom:32k, 0~7FFF
+SRam:256k, 8_0000~C_0000
+#空间分配：
+sram end   <= 0xc0000
+sp      <=  0xbfffc ↓  #栈指针
+
+.bss
+.data
+.text   <=  0xa0000 ↑
+malloc  <=  0xa0000 ↓
+gd      <=  0xa0000-sizeof(malloc)  ↓
+bd      <=  0xa0000-sizeof(malloc)-sizeof(gd) ↓
+
+sram start <= 0x80000
+
+
+g1编译：
+编译错误：libgcc.a  VFP浮点类型不一致，改 arch/arm/config.mk 21行-msoft-float为-mhard-float
+编译警告：uses 4-byte wchar_t yet the output is to use 2-byte wchar_t; use of wchar_t values across objects may fail 改顶层Makefile 419行-fshort-wchar关闭
+bss： 程序运行前需要先初始化bss段为0，汇编写
+.macro CLEAR_BSS
+	ldr	r0, =__bss_start	/* this is auto-relocated! */
+	ldr	r1, =__bss_end		/* this is auto-relocated! */
+	mov	r2, #0x00000000		/* prepare zero to clear BSS */
+
+clbss_l:cmp	r0, r1			/* while not at end of BSS */
+	strlo	r2, [r0]		/* clear 32-bit BSS word */
+	addlo	r0, r0, #4		/* move to next */
+	blo	clbss_l
+.endm
+
+u-boot重定位设计逻辑（猜测）：  把全局变量、堆、栈都放在最高地址，后面只需要把程序和数据移动到高地址
+编译器需要大于gcc 6，且需要硬浮点编译器
+全局（静态）变量初始化： 初始化=0，是相当于不初始化的，放入bss段
+反汇编：    /data/yuhl/gcc/gcc-arm-11.2-2022.02-x86_64-arm-none-linux-gnueabihf/bin/arm-none-linux-gnueabihf-objdump -D -S u-boot > u-boot.s   //-D是bss段加入的意思
+地址：  文件传输的地址需要和汇编文件一致，汇编文件可以去top/u-boot.lds(源：arch/xxx/cpu/u-boot.lds)看链接文件
+汇编跳转机器码计算：  机器码（1字节）+偏移（3字节）
+	举例：e0000:	ea0000b8 	b	e02e8 <reset>
+	机器码：b 0xea ; bl 0xeb
+	偏移：(目标地址-指令地址-8)/4 = 偏移（3字节）
+	计算机器码：(0xe02e8-0xe0000-8)/4=0xb8 , 0xea000000 | 0xb8 = 0xea0000b8
+汇编添加串口打印：
+打印时：bl uart_test_yuhl
+//定义函数
+ENTRY(uart_test_yuhl)
+/*add uart test*/
+	mov r7, #APB_SYS_BASE   //系统寄存器基地址
+	orr r7, r7, #0xa0000   //0xa0000串口的偏移地址
+1:
+	ldr r5, [r7, #0x18]
+	and r5, r5, #0x20
+	teq r5, #0x20
+	beq 1b
+	mov r6, #'Y'
+	str r6, [r7]
+
+ENDPROC(uart_test_yuhl)
+				
+
+
+
+riscv:
+程序入口：\arch\riscv\cpu\start.S(board_init_f => board_init_r)
+Load access fault 错误：访问了非法内存(空指针操作，数组越界)
+自动挂起不可操作：访问不存在地址 或者 地址冲突
+
+汇编指令：
+li t0, -16  #把一个立即数加载到寄存器
+la t0, __bss_start   #把内存地址加载到寄存器
+
+malloc: 因此mALLOc会在编译的时候变成malloc，注意#define的妙用
+#define fREe		free
+#define mALLOc		malloc
+Void_t* mALLOc(size_t);
+void    fREe(Void_t*);
+
+
+uboot:
+make savedefconfig #会把当前的.config变成当前目录的defconfig
+make xxx_defconfig #会去configs/目录把这个defconfig配置成.config
+		#未完成：找到两边转化的规律
+env初始化流程：我们的本地env保存在一个hash中
+init_sequence_f[](common/board_f.c) 
+=> env_init(env/env.c):寻找外部载体，我们这里是ENVL_SPI_FLASH(env/sf.c，重新绑定了我们的qspi操作函数，注册env_driver段)，如果有init函数就执行
+绑定:env_erase() <=> env_driver.erase()//擦除norfalsh
+	 env_save() <=> env_driver.save() //从hash保存到norfalsh
+	 env_load() <=> env_driver.load() //从norfalsh导出到hash
+
+=> cmd/nvedit.c: 注册所有命令对env进行查查看、修改、保存
+
+norflash:
+只能读，且值一致，不能擦不能写，可能是flash接触不良或者坏了。
+
+
+
+
+
+
+g0平台：foga版本：G0_BASE_V28_R4d3002b_1_r2308_test_wangxx_211220_external_release
+串口识别：
+1、检查线是否插紧，可以重新插拔一下
+串口打开：
+1、确保已接串口线，且接线正确
+2、确保时钟树时钟：Global Clock → (50-100-100) → program
+3、拨码开关确定启动方式：
+	sw12  1号拨码开关是用来控制从CPU的rom启动还是nor flash启动 （ON是rom 启动  OFF是nor flash 启动）
+	J50 GPIO 8  是用来控制加解密的开关 （GPIO 8为高电平 加密状态 ，低电平非加密状态）
+
+软件：
+AEConsel.exe 管理员密码：12345678
+CRT5.0路径：D:\Tools\SecureCRT
+
+编译调试：
+1、定时器触发之后需要 READL(base_addr, TIMER_CLEAR_INTR); 
+	读取这个寄存器就会清理掉触发标志位；否则不会清除，一直存在也不会再触发
+
+文件传输：cmd/load.c
+注意：串口文件传输过程中不能加任何的打印到串口的信息，这涉及到协议的识别及握手。
+#文件传输的时候不能开中断定时器，擦写flash也注意先停掉#貌似没啥影响
+1、起始条件，间隔3s发NAK或者'C'
+2、tstc()函数的返回值保持与uboot原生一致，可读标志
+3、注意操作的地址是否合法，否则程序会挂死
+4、****高速传输的时候，尽量直接操作寄存器，否则会丢字节（归根结底还是芯片性能的问题）
+5、注意一些做循环的++标志，要用volatile修饰变量，否则会被编译器优化掉
+
+loadb报错：
+解决：http://gerrit.srv/c/cxwl/uboot/+/6411/2/drivers/serial/serial_cxwl.c#30
+	
+
+git操作：
+  490  vim .git/config #git config core.fileMode false  忽略文件权限的变化
+  491  history
+  492  git log
+  493  git diff  
+  494  git log
+  495  history
+  496  git diff  #查看文件在工作目录与暂存区的差别
+  497  git status -uno  #显示工作目录和暂存区的状态
+  498  git diff >  0413.patch 
+  499  git checkout  .
+  500  git diff
+  501  git pull   #从远程仓库同步最新代码
+  502  git pull origin gx-compatible
+  503  git diff
+  504  patch  -p1  <  0413.patch
+  506  git diff
+  507  gitk
+  508  histroy
+
+  git commit --amend  可以持续将本地修改提交到本次暂存区中（add或rm）
+  git cherry-pick <commitHash>    将指定的提交应用于其他分支（当前默认）
+  git cherry-pick --continue  如果上面有冲突，解决冲突之后继续提交
+  
+  git add .
+  git commit -a
+  git push origin gx-compatible:refs/for/gx-compatible 
+  
+  git reset --hard commit_id  #版本回退，不是Change-Id
+  
+ #把一个本地推送到多个分支
+  git push origin gx-compatible:refs/for/gx-compatible #commit_id f3aea244218a6ed94d70186ff5fcc1301849bedf
+  git checkout g0val
+  git cherry-pick f3aea244218a6ed94d70186ff5fcc1301849bedf  #这时会在g0val有最新的提交
+  git push origin g0val:refs/for/g0val
+  
+  git commit --allow-empty   #直接保存，然后再提交到另一分支
+  git push origin gx-compatible:refs/for/gx-compatible
+  
+  git log --pretty=oneline #简略log
+  
+  grep -rnR "xxxxxx"   #当前目录搜索
+  
+  git config --list
+  git config xxx xxx(core.filemode false)
+  
+ #只提交一部分文件
+ git add file
+ git commit -m "随便写"
+ git commit --amend   #这时候可以修改，必须有上一步，否则会提交本地所有改动
+ push...
+
+迁移git仓库某分支到另一仓库某分支
+当前地址及分支：http://gerrit.srv/g0/mcu_sysguard gx-compatible
+目的地址及分支：http://gerrit.srv/gx/mcu_sysguard develop
+cd g0/mcu_sysguard && git checkout gx-compatible
+git remote add global http://gerrit.srv/gx/mcu_sysguard
+git checkout -b develop
+git push global develop
+cd gx/mcu_sysguard
+git pull origin develop 
+
+
+
+switch: 多选项匹配  case x ... x:
+switch (irq){
+case 39 ... 57:
+	reg = SYS_REG_CPU_INTMASK0;
+	bit = irq - 39;
+	break;
+}
+ 
+  
+tar -cvf xxx.tar xxx yyy #仅打包不压缩
+tar -zcvf xxx.tar.gz xxx yyy  #打包后，已gzip压缩
+
+tar -zxvf xxx.tar.gz (-C ./)    #解压到(当前目录)，默认当前目录
+
+tar -jxf xxx.tar.bz2   #解压到(当前目录)
+
+tar -Jxf xxx.tar.xz   #解压到(当前目录)
+  
+arm寄存器：
+r12  ip寄存器，内部程序调用暂存寄存器
+r13  sp寄存器，栈指针
+r14  lr寄存器，程序跳转（子程序调用，中断跳转）后，arm自动在该寄存器存入原程序（未跳转）的下一条指令的地址
+r15  pc寄存器，正在取指的地址（arm采用2级流水线，因此是当前正在执行指令地址+8）
+  
+将git提交的文件批量转换unix换行符：
+dos2unix `git status | grep modified | awk '{printf $2;printf " "}'`
+
+
+Palladium平台:
+文件格式处理：
+hexdump -C  -v g1p_mcufw_enc.bin  > g1p_mcufw_enc_hex.bin
+python3.6 bin1.py  g1p_mcufw_enc_hex.bin  g1p_mcufw_enc_hex_palading.bin
+
+scp命令复制文件或者目录到其他机器：
+scp file(-r list) inno@100.58.30.173:/home/inno/yuhl
+
+scp -r mcu_upgradetool/ inno@100.58.20.95:/home/inno/yuhl
+
+
+sudo /bin/ota_upgrade -g 0 -t 300 -f g0_mcufw.bin
+
+
+memcpy 是拷贝字节，注意这点，不管前面的数据是什么类型
+
+
+vi test.txt
+
+%!xxd    可以转换为16进制模式
+%!xxd -r   退出16进制模式
+
+
+win+ctrl+enter  讲述人功能
+清除芯动muc内存：C:\Users\Innosilicon\AppData\Local\Temp
+
+CRT5.0密匙：
+名字：Windows
+公司：IC
+序列号：03-50-008187
+许可密钥：ACDDHB JQ2D9S 7ZAA5G CVNX41 ADAQB9 6ZVPYK PQ4EF1 84V5JM
+发布日期：26-07-2006
+
+hwinfo解保护：
+g0:mw 2d810fc 2
+g1/g1p:mw c880fc 2
+g0m:mw 2e10fc 2
+
+框架开发注意事项：
+1、不要动公共文件，包括chip里面的函数接口（内容可以根据实际更改），board的公共部分，需要添加可以跟翔哥或者我沟通下，尽量在2行内搞定
+2、不要分配很大的数组或者字符串数组，用算法优化；内存太有限了
+3、将git提交的文件批量转换unix换行符：dos2unix `git status | grep modified | awk '{printf $2;printf " "}'`
+4、操作内存用统一的接口，不要自己再封装一模一样的底层接口，代码风格保持一致
+
+
+先使能pcie：
+sudo ./devmset 0x4200c880fc 0x2000 1 32
+sudo ./devmset 0x4203200c88 0x40000000 1 32
+
+
+
+
+
+
