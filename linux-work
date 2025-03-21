@@ -1,0 +1,8 @@
+cmake -DCMAKE_BUILD_TYPE=Debug ..  #编译debug版本程序
+cmake --build .
+
+#gdb中以16进制显示内存内容,100个；xb-字节单位显示，xh-字，xw-双字，xg-四字
+x/100xg 0xffff8882db9a0000  #vscode中前面加-exec
+
+sudo cat /proc/iomem    #查看机器的物理空间布局
+sudo pmap pid      #查看进程的虚拟地址空间映射
